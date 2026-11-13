@@ -1,0 +1,903 @@
+################################################################################
+# Deye SUN-10K-SG05LP3-EU-SM2 (three-phase) — ESPHome BLE Integration
+# ESP32-C6 · Deye WiBLE logger stick (Bluetooth LE)
+#
+# Protocol (from community reverse-engineering of the Deye app BLE traffic):
+#   Service 0x0922 · write char 0xFEC7 · notify char 0xFED8
+#   TX: "AT+INVDATA=8,<modbus frame hex + CRC16>\r\n"
+#   RX: "+ok=<uppercase hex modbus response incl CRC>\r\n"
+#
+# Register map: three-phase Deye hybrid (deye_p3 — same map ha-solarman uses),
+# NOT the single-phase map from the original shared config.
+#
+# Poll blocks (9 reads per cycle, ≤14 regs each to stay under BLE MTU):
+#   1  0x0202 ×12  Energy A: battery charge/discharge, grid import/export (daily+total)
+#   2  0x020E ×10  Energy B: load consumption, PV production (daily+total)
+#   3  0x021C ×2   DC / AC temperature
+#   4  0x024A ×6   Battery: temp, V, SOC, power, current
+#   5  0x0256 ×12  Grid: L1-3 voltage, internal CT power, frequency
+#   6  0x0265 ×13  Grid: external CT currents/power, PF, L1-3 power, total
+#   7  0x0273 ×12  Inverter output: L1-3 V/I/P, total, frequency
+#   8  0x0280 ×14  Load: UPS power, L1-3 voltage, L1-3 power, total
+#   9  0x02A0 ×12  PV: PV1-4 power, PV1-4 V/I
+################################################################################
+
+substitutions:
+  devicename: 'deye-sun10k'
+  friendly_name: 'Deye SUN-10K'
+  device_description: 'SUN-10K-SG05LP3-EU-SM2 via BLE'
+  # BLE MAC address of YOUR logger stick (see README: "Find the logger MAC")
+  ble_mac: 'AA:BB:CC:DD:EE:FF'
+  service_uuid: '00000922-0000-1000-8000-00805f9b34fb'
+  read_uuid: '0000fed8-0000-1000-8000-00805f9b34fb'
+  write_uuid: '0000fec7-0000-1000-8000-00805f9b34fb'
+
+  # Modbus frames WITHOUT CRC (computed at runtime): 01 03 <start> <count>
+  cmd_energy_a: '01030202000C'  # 514–525  battery+grid energy counters
+  cmd_energy_b: '0103020E000A'  # 526–535  load+production energy counters
+  cmd_temps: '0103021C0002'     # 540–541  DC/AC temperature
+  cmd_battery: '0103024A0006'   # 586–591  battery live data
+  cmd_grid_v: '01030256000C'    # 598–609  grid voltages, internal CT, freq
+  cmd_grid_p: '01030265000D'    # 613–625  external CT, PF, grid power
+  cmd_inverter: '01030273000C'  # 627–638  inverter output
+  cmd_load: '01030280000E'      # 640–653  UPS + load
+  cmd_pv: '010302A0000C'        # 672–683  PV1-4
+
+esphome:
+  name: '${devicename}'
+  friendly_name: '${friendly_name}'
+  comment: '${device_description}'
+
+esp32:
+  board: esp32-c6-devkitc-1
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+
+logger:
+  level: DEBUG
+  hardware_uart: UART0
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # Fallback AP if the Wi-Fi above is unreachable: connect and configure at 192.168.4.1
+  ap:
+    ssid: '${devicename}'
+    password: !secret fallback_ap_password
+  power_save_mode: none
+
+captive_portal:
+
+################################################################################
+# BLE
+################################################################################
+
+esp32_ble_tracker:
+  scan_parameters:
+    interval: 1100ms
+    window: 1100ms
+    active: true
+
+ble_client:
+  - mac_address: '${ble_mac}'
+    id: deye_ble
+    on_connect:
+      then:
+        - lambda: 'ESP_LOGI("deye", "Connected to logger"); id(last_successful_poll) = millis();'
+        - delay: 2000ms
+        - script.execute: poll_all_blocks
+    on_disconnect:
+      then:
+        - lambda: 'ESP_LOGI("deye", "BLE disconnected");'
+
+################################################################################
+# Globals
+################################################################################
+
+globals:
+  - id: current_block
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: pending_cmd
+    type: std::string
+    restore_value: no
+    initial_value: '""'
+  - id: ble_reconnect_counter
+    type: int
+    restore_value: no
+    initial_value: '0'
+  - id: last_successful_poll
+    type: uint32_t
+    restore_value: no
+    initial_value: '0'
+
+################################################################################
+# Polling
+################################################################################
+
+interval:
+  - interval: 30s
+    then:
+      - if:
+          condition:
+            lambda: 'return id(deye_ble).connected() && id(ble_reconnect_interval).state == 0;'
+          then:
+            - script.execute: poll_all_blocks
+
+  # Reconnect countdown (used when ble_reconnect_interval > 0)
+  - interval: 1s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(ble_reconnect_interval).state > 0 &&
+                     !id(deye_ble).connected() &&
+                     !id(poll_all_blocks).is_running() &&
+                     id(ble_reconnect_counter) > 0 &&
+                     --id(ble_reconnect_counter) == 0;
+          then:
+            - lambda: 'ESP_LOGI("deye", "Reconnecting to inverter...");'
+            - switch.turn_on: inverter_ble_switch
+
+  # Watchdog — force reconnect if no notification for >90 s in permanent mode
+  - interval: 10s
+    then:
+      - if:
+          condition:
+            lambda: |-
+              return id(ble_reconnect_interval).state == 0 &&
+                     id(deye_ble).connected() &&
+                     id(last_successful_poll) != 0 &&
+                     (millis() - id(last_successful_poll)) > 90000;
+          then:
+            - lambda: 'ESP_LOGW("deye", "BLE watchdog: no response in 90 s — forcing reconnect");'
+            - switch.turn_off: inverter_ble_switch
+            - delay: 2s
+            - switch.turn_on: inverter_ble_switch
+
+################################################################################
+# Scripts
+################################################################################
+
+script:
+  # Build "AT+INVDATA=8,<frame+CRC>\r\n" and write it to the logger
+  - id: send_modbus_cmd
+    mode: queued
+    parameters:
+      frame: string
+    then:
+      - lambda: |-
+          auto h = [](char c) -> uint8_t {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+            return 0;
+          };
+          std::vector<uint8_t> bytes;
+          for (size_t i = 0; i + 1 < frame.size(); i += 2)
+            bytes.push_back((h(frame[i]) << 4) | h(frame[i+1]));
+
+          uint16_t crc = 0xFFFF;
+          for (auto b : bytes) {
+            crc ^= b;
+            for (int i = 0; i < 8; i++)
+              crc = (crc & 1) ? (crc >> 1) ^ 0xA001 : crc >> 1;
+          }
+
+          char buf[5];
+          snprintf(buf, sizeof(buf), "%02X%02X", crc & 0xFF, (crc >> 8) & 0xFF);
+          id(pending_cmd) = "AT+INVDATA=8," + frame + buf + "\r\n";
+          ESP_LOGD("deye", "TX: %s", id(pending_cmd).c_str());
+      - ble_client.ble_write:
+          id: deye_ble
+          service_uuid: '${service_uuid}'
+          characteristic_uuid: '${write_uuid}'
+          value: !lambda |-
+            return std::vector<uint8_t>(id(pending_cmd).begin(), id(pending_cmd).end());
+
+  - id: poll_all_blocks
+    mode: single
+    then:
+      - lambda: 'id(current_block) = 1;'
+      - script.execute: { id: send_modbus_cmd, frame: '${cmd_energy_a}' }
+      - delay: 400ms
+      - lambda: 'id(current_block) = 2;'
+      - script.execute: { id: send_modbus_cmd, frame: '${cmd_energy_b}' }
+      - delay: 400ms
+      - lambda: 'id(current_block) = 3;'
+      - script.execute: { id: send_modbus_cmd, frame: '${cmd_temps}' }
+      - delay: 400ms
+      - lambda: 'id(current_block) = 4;'
+      - script.execute: { id: send_modbus_cmd, frame: '${cmd_battery}' }
+      - delay: 400ms
+      - lambda: 'id(current_block) = 5;'
+      - script.execute: { id: send_modbus_cmd, frame: '${cmd_grid_v}' }
+      - delay: 400ms
+      - lambda: 'id(current_block) = 6;'
+      - script.execute: { id: send_modbus_cmd, frame: '${cmd_grid_p}' }
+      - delay: 400ms
+      - lambda: 'id(current_block) = 7;'
+      - script.execute: { id: send_modbus_cmd, frame: '${cmd_inverter}' }
+      - delay: 400ms
+      - lambda: 'id(current_block) = 8;'
+      - script.execute: { id: send_modbus_cmd, frame: '${cmd_load}' }
+      - delay: 400ms
+      - lambda: 'id(current_block) = 9;'
+      - script.execute: { id: send_modbus_cmd, frame: '${cmd_pv}' }
+      - delay: 400ms
+      - if:
+          condition:
+            lambda: 'return id(ble_reconnect_interval).state > 0;'
+          then:
+            - lambda: |-
+                id(ble_reconnect_counter) = (int)id(ble_reconnect_interval).state;
+                ESP_LOGI("deye", "Poll done — disconnecting, reconnecting in %.0fs",
+                         id(ble_reconnect_interval).state);
+            - switch.turn_off: inverter_ble_switch
+
+################################################################################
+# BLE notify parser — dispatches on current_block
+################################################################################
+
+sensor:
+  - platform: ble_client
+    type: characteristic
+    ble_client_id: deye_ble
+    id: ble_raw_notify
+    name: 'BLE Raw Notify'
+    service_uuid: '${service_uuid}'
+    characteristic_uuid: '${read_uuid}'
+    notify: true
+    internal: true
+    update_interval: never
+    lambda: |-
+      std::string raw_str(x.begin(), x.end());
+      ESP_LOGD("deye", "RX block=%d: %s", id(current_block), raw_str.c_str());
+
+      if (x.size() < 5 || x[0] != '+' || x[1] != 'o' || x[2] != 'k' || x[3] != '=') {
+        ESP_LOGW("deye", "Unexpected response: %s", raw_str.c_str());
+        return NAN;
+      }
+
+      std::string hex_str;
+      for (size_t i = 4; i < x.size(); i++) {
+        if (x[i] == '\r' || x[i] == '\n') break;
+        hex_str += (char)x[i];
+      }
+      if (hex_str.size() % 2 != 0) {
+        ESP_LOGW("deye", "Odd hex length: %d", (int)hex_str.size());
+        return NAN;
+      }
+
+      auto h = [](char c) -> uint8_t {
+        if (c >= '0' && c <= '9') return c - '0';
+        if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+        if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+        return 0;
+      };
+      std::vector<uint8_t> buf;
+      buf.reserve(hex_str.size() / 2);
+      for (size_t i = 0; i < hex_str.size(); i += 2)
+        buf.push_back((h(hex_str[i]) << 4) | h(hex_str[i+1]));
+
+      if (buf.size() < 3 || buf[0] != 0x01 || buf[1] != 0x03) {
+        ESP_LOGW("deye", "Not a valid Modbus frame");
+        return NAN;
+      }
+      uint8_t byte_count = buf[2];
+      if (buf.size() < (size_t)(3 + byte_count + 2)) {
+        ESP_LOGW("deye", "Incomplete frame: have %d need %d", (int)buf.size(), 3 + byte_count + 2);
+        return NAN;
+      }
+
+      // Guard: response size must match the block we think we asked for.
+      // Prevents mislabeled parses when a late response arrives after
+      // current_block has already advanced (seen right after connect).
+      static const uint8_t expected_bytes[10] = {0, 24, 20, 4, 12, 24, 26, 24, 28, 24};
+      int cb = id(current_block);
+      if (cb >= 1 && cb <= 9 && byte_count != expected_bytes[cb]) {
+        ESP_LOGW("deye", "Byte count %d != expected %d for block %d — dropping frame",
+                 byte_count, expected_bytes[cb], cb);
+        return NAN;
+      }
+
+      auto reg = [&](int n) -> uint16_t {
+        size_t p = 3 + n * 2;
+        return ((uint16_t)buf[p] << 8) | buf[p + 1];
+      };
+      auto reg_s = [&](int n) -> int16_t {
+        return (int16_t)reg(n);
+      };
+      // 32-bit: low word first (Deye convention)
+      auto reg_d = [&](int lo) -> uint32_t {
+        return ((uint32_t)reg(lo + 1) << 16) | reg(lo);
+      };
+
+      switch (id(current_block)) {
+
+        // Block 1 — 0x0202 ×12: battery + grid energy counters
+        case 1:
+          id(daily_battery_charge).publish_state(reg(0) * 0.1f);
+          id(daily_battery_discharge).publish_state(reg(1) * 0.1f);
+          id(total_battery_charge).publish_state(reg_d(2) * 0.1f);
+          id(total_battery_discharge).publish_state(reg_d(4) * 0.1f);
+          id(daily_energy_bought).publish_state(reg(6) * 0.1f);
+          id(daily_energy_sold).publish_state(reg(7) * 0.1f);
+          id(total_energy_bought).publish_state(reg_d(8) * 0.1f);
+          id(total_energy_sold).publish_state(reg_d(10) * 0.1f);
+          break;
+
+        // Block 2 — 0x020E ×10: load + production energy counters
+        case 2:
+          id(daily_load_consumption).publish_state(reg(0) * 0.1f);
+          id(total_load_consumption).publish_state(reg_d(1) * 0.1f);
+          id(daily_production).publish_state(reg(3) * 0.1f);
+          id(total_production).publish_state(reg_d(8) * 0.1f);
+          break;
+
+        // Block 3 — 0x021C ×2: temperatures ((raw-1000)*0.1)
+        case 3:
+          id(dc_temperature).publish_state((reg(0) - 1000) * 0.1f);
+          id(ac_temperature).publish_state((reg(1) - 1000) * 0.1f);
+          break;
+
+        // Block 4 — 0x024A ×6: battery live
+        case 4:
+          id(battery_temperature).publish_state((reg(0) - 1000) * 0.1f);
+          id(battery_voltage).publish_state(reg(1) * 0.01f);
+          id(battery_soc).publish_state((float)reg(2));
+          id(battery_power).publish_state((float)reg_s(4));
+          id(battery_current).publish_state(reg_s(5) * 0.01f);
+          break;
+
+        // Block 5 — 0x0256 ×12: grid voltages, internal CT, frequency
+        case 5:
+          id(grid_l1_voltage).publish_state(reg(0) * 0.1f);
+          id(grid_l2_voltage).publish_state(reg(1) * 0.1f);
+          id(grid_l3_voltage).publish_state(reg(2) * 0.1f);
+          id(internal_ct_power).publish_state((float)reg_s(9));
+          id(grid_frequency).publish_state(reg(11) * 0.01f);
+          break;
+
+        // Block 6 — 0x0265 ×13: external CT, PF, grid power
+        case 6:
+          id(external_ct_l1_power).publish_state((float)reg_s(3));
+          id(external_ct_l2_power).publish_state((float)reg_s(4));
+          id(external_ct_l3_power).publish_state((float)reg_s(5));
+          id(external_ct_power).publish_state((float)reg_s(6));
+          id(grid_l1_power).publish_state((float)reg_s(9));
+          id(grid_l2_power).publish_state((float)reg_s(10));
+          id(grid_l3_power).publish_state((float)reg_s(11));
+          id(grid_power).publish_state((float)reg_s(12));
+          break;
+
+        // Block 7 — 0x0273 ×12: inverter output
+        case 7:
+          id(output_l1_voltage).publish_state(reg(0) * 0.1f);
+          id(output_l2_voltage).publish_state(reg(1) * 0.1f);
+          id(output_l3_voltage).publish_state(reg(2) * 0.1f);
+          id(inverter_l1_power).publish_state((float)reg_s(6));
+          id(inverter_l2_power).publish_state((float)reg_s(7));
+          id(inverter_l3_power).publish_state((float)reg_s(8));
+          id(inverter_power).publish_state((float)reg_s(9));
+          id(output_frequency).publish_state(reg(11) * 0.01f);
+          break;
+
+        // Block 8 — 0x0280 ×14: UPS + load
+        case 8:
+          id(ups_power).publish_state((float)reg_s(3));
+          id(load_l1_voltage).publish_state(reg(4) * 0.1f);
+          id(load_l2_voltage).publish_state(reg(5) * 0.1f);
+          id(load_l3_voltage).publish_state(reg(6) * 0.1f);
+          id(load_l1_power).publish_state((float)reg_s(10));
+          id(load_l2_power).publish_state((float)reg_s(11));
+          id(load_l3_power).publish_state((float)reg_s(12));
+          id(load_power).publish_state((float)reg_s(13));
+          break;
+
+        // Block 9 — 0x02A0 ×12: PV
+        case 9:
+          id(pv1_power).publish_state((float)reg(0));
+          id(pv2_power).publish_state((float)reg(1));
+          id(pv3_power).publish_state((float)reg(2));
+          id(pv4_power).publish_state((float)reg(3));
+          id(pv1_voltage).publish_state(reg(4) * 0.1f);
+          id(pv1_current).publish_state(reg(5) * 0.1f);
+          id(pv2_voltage).publish_state(reg(6) * 0.1f);
+          id(pv2_current).publish_state(reg(7) * 0.1f);
+          id(pv3_voltage).publish_state(reg(8) * 0.1f);
+          id(pv3_current).publish_state(reg(9) * 0.1f);
+          id(pv4_voltage).publish_state(reg(10) * 0.1f);
+          id(pv4_current).publish_state(reg(11) * 0.1f);
+          id(total_pv_power).publish_state((float)(reg(0) + reg(1) + reg(2) + reg(3)));
+          break;
+      }
+
+      id(last_successful_poll) = millis();
+      return NAN;
+
+  # ── Energy counters (native, inverter-maintained — use in Energy Dashboard) ─
+  - platform: template
+    name: 'Daily Production'
+    id: daily_production
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Total Production'
+    id: total_production
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Daily Load Consumption'
+    id: daily_load_consumption
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Total Load Consumption'
+    id: total_load_consumption
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Daily Energy Bought'
+    id: daily_energy_bought
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Daily Energy Sold'
+    id: daily_energy_sold
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Total Energy Bought'
+    id: total_energy_bought
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Total Energy Sold'
+    id: total_energy_sold
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Daily Battery Charge'
+    id: daily_battery_charge
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Daily Battery Discharge'
+    id: daily_battery_discharge
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Total Battery Charge'
+    id: total_battery_charge
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Total Battery Discharge'
+    id: total_battery_discharge
+    unit_of_measurement: 'kWh'
+    device_class: energy
+    state_class: total_increasing
+    accuracy_decimals: 1
+
+  # ── Temperatures ─────────────────────────────────────────────────────────
+  - platform: template
+    name: 'DC Temperature'
+    id: dc_temperature
+    unit_of_measurement: '°C'
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'AC Temperature'
+    id: ac_temperature
+    unit_of_measurement: '°C'
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+
+  # ── Battery ──────────────────────────────────────────────────────────────
+  - platform: template
+    name: 'Battery Temperature'
+    id: battery_temperature
+    unit_of_measurement: '°C'
+    device_class: temperature
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Battery Voltage'
+    id: battery_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 2
+  - platform: template
+    name: 'Battery SOC'
+    id: battery_soc
+    unit_of_measurement: '%'
+    device_class: battery
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Battery Power'
+    id: battery_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+    # Positive = charging, negative = discharging
+  - platform: template
+    name: 'Battery Current'
+    id: battery_current
+    unit_of_measurement: 'A'
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 2
+
+  # ── Grid ─────────────────────────────────────────────────────────────────
+  - platform: template
+    name: 'Grid L1 Voltage'
+    id: grid_l1_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Grid L2 Voltage'
+    id: grid_l2_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Grid L3 Voltage'
+    id: grid_l3_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Grid Frequency'
+    id: grid_frequency
+    unit_of_measurement: 'Hz'
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 2
+  - platform: template
+    name: 'Internal CT Power'
+    id: internal_ct_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'External CT L1 Power'
+    id: external_ct_l1_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'External CT L2 Power'
+    id: external_ct_l2_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'External CT L3 Power'
+    id: external_ct_l3_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'External CT Power'
+    id: external_ct_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Grid L1 Power'
+    id: grid_l1_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Grid L2 Power'
+    id: grid_l2_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Grid L3 Power'
+    id: grid_l3_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Grid Power'
+    id: grid_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+
+  # ── Inverter output ──────────────────────────────────────────────────────
+  - platform: template
+    name: 'Output L1 Voltage'
+    id: output_l1_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Output L2 Voltage'
+    id: output_l2_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Output L3 Voltage'
+    id: output_l3_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Inverter L1 Power'
+    id: inverter_l1_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Inverter L2 Power'
+    id: inverter_l2_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Inverter L3 Power'
+    id: inverter_l3_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Inverter Power'
+    id: inverter_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Output Frequency'
+    id: output_frequency
+    unit_of_measurement: 'Hz'
+    device_class: frequency
+    state_class: measurement
+    accuracy_decimals: 2
+
+  # ── Load ─────────────────────────────────────────────────────────────────
+  - platform: template
+    name: 'UPS Power'
+    id: ups_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Load L1 Voltage'
+    id: load_l1_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Load L2 Voltage'
+    id: load_l2_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Load L3 Voltage'
+    id: load_l3_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'Load L1 Power'
+    id: load_l1_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Load L2 Power'
+    id: load_l2_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Load L3 Power'
+    id: load_l3_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Load Power'
+    id: load_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+
+  # ── PV ───────────────────────────────────────────────────────────────────
+  - platform: template
+    name: 'PV1 Power'
+    id: pv1_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'PV2 Power'
+    id: pv2_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'PV3 Power'
+    id: pv3_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'PV4 Power'
+    id: pv4_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'Total PV Power'
+    id: total_pv_power
+    unit_of_measurement: 'W'
+    device_class: power
+    state_class: measurement
+    accuracy_decimals: 0
+  - platform: template
+    name: 'PV1 Voltage'
+    id: pv1_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'PV1 Current'
+    id: pv1_current
+    unit_of_measurement: 'A'
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'PV2 Voltage'
+    id: pv2_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'PV2 Current'
+    id: pv2_current
+    unit_of_measurement: 'A'
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'PV3 Voltage'
+    id: pv3_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'PV3 Current'
+    id: pv3_current
+    unit_of_measurement: 'A'
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'PV4 Voltage'
+    id: pv4_voltage
+    unit_of_measurement: 'V'
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 1
+  - platform: template
+    name: 'PV4 Current'
+    id: pv4_current
+    unit_of_measurement: 'A'
+    device_class: current
+    state_class: measurement
+    accuracy_decimals: 1
+
+number:
+  # 0 = permanently connected (real-time, but Deye Cloud sync stalls)
+  # >0 = disconnect after each poll, reconnect after N seconds (cloud coexists)
+  - platform: template
+    name: 'BLE Reconnect Interval'
+    id: ble_reconnect_interval
+    unit_of_measurement: 's'
+    icon: mdi:bluetooth-connect
+    min_value: 0
+    max_value: 600
+    step: 10
+    restore_value: true
+    initial_value: 0
+    optimistic: true
+    on_value:
+      then:
+        - if:
+            condition:
+              lambda: 'return x == 0 && !id(deye_ble).connected();'
+            then:
+              - lambda: |-
+                  id(ble_reconnect_counter) = 0;
+                  ESP_LOGI("deye", "Reconnect interval set to 0 while disconnected — reconnecting immediately");
+              - switch.turn_on: inverter_ble_switch
+
+switch:
+  - platform: ble_client
+    ble_client_id: deye_ble
+    name: 'Inverter BLE Connection'
+    id: inverter_ble_switch
+    icon: mdi:bluetooth-connect
+    restore_mode: RESTORE_DEFAULT_ON
+    internal: true
