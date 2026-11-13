@@ -1,5 +1,7 @@
 # Deye inverter → Home Assistant over Bluetooth (ESPHome, ESP32)
 
+🇵🇹 [Versão em português](README.pt.md)
+
 Read a **Deye three‑phase hybrid inverter** in real time from Home Assistant, **locally**, through the Bluetooth LE interface of its **WiBLE logger stick**, using a cheap ESP32 running ESPHome.
 
 No cloud, no Modbus wiring, no changes to the inverter. One ESP32 near the inverter, one YAML file.
